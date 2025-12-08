@@ -67,6 +67,8 @@ func main() {
 	uploadedFiles := uploaded.New("uploaded.json")
 	if err := uploadedFiles.Load(); err != nil {
 		logger.Write("WARNING: Failed to load uploaded.json: %v", err)
+		logger.Write("Falling back to in-memory upload tracking; uploaded.json will not be used.")
+		uploadedFiles.DisablePersistence()
 	} else {
 		logger.Write("Loaded upload history with %d processed files", len(uploadedFiles.Files))
 	}
