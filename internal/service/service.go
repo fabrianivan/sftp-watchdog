@@ -33,7 +33,13 @@ type Service struct {
 	scanMu          sync.Mutex
 }
 
-func New(cfg *config.Config, srcMgr, dstMgr *sftpclient.Manager, uploaded *uploaded.Files, notifier notifier.Notifier, logger *logging.Logger, progressOutput io.Writer) *Service {
+type UploadStat struct {
+	Filename string
+	Speed    string
+	Percent  float64 // 0.0 - 1.0
+}
+
+func New(cfg *config.Config, srcMgr, dstMgr *sftpclient.Manager, uploaded *uploaded.Files, notifier notifier.Notifier, logger *logging.Logger, progressOutput io.Writer, statsCh chan<- UploadStat) *Service {
 	if progressOutput == nil {
 		progressOutput = io.Discard
 	}
@@ -45,7 +51,7 @@ func New(cfg *config.Config, srcMgr, dstMgr *sftpclient.Manager, uploaded *uploa
 		notifier:        notifier,
 		logger:          logger,
 		progressOutput:  progressOutput,
-		progressManager: newProgressBarManager(progressOutput, notifier, logger),
+		progressManager: newProgressBarManager(progressOutput, notifier, logger, statsCh),
 		scanNowCh:       make(chan struct{}, 4),
 	}
 }
@@ -711,19 +717,21 @@ func testSFTPCapabilities(mgr *sftpclient.Manager, name string, logger *logging.
 }
 
 type progressBarManager struct {
-	mu     sync.Mutex
-	bars   map[string]*progressbar.ProgressBar
-	writer io.Writer
-	notify notifier.Notifier
-	logger *logging.Logger
+	mu      sync.Mutex
+	bars    map[string]*progressbar.ProgressBar
+	writer  io.Writer
+	notify  notifier.Notifier
+	logger  *logging.Logger
+	statsCh chan<- UploadStat
 }
 
-func newProgressBarManager(writer io.Writer, notify notifier.Notifier, logger *logging.Logger) *progressBarManager {
+func newProgressBarManager(writer io.Writer, notify notifier.Notifier, logger *logging.Logger, statsCh chan<- UploadStat) *progressBarManager {
 	return &progressBarManager{
-		bars:   make(map[string]*progressbar.ProgressBar),
-		writer: writer,
-		notify: notify,
-		logger: logger,
+		bars:    make(map[string]*progressbar.ProgressBar),
+		writer:  writer,
+		notify:  notify,
+		logger:  logger,
+		statsCh: statsCh,
 	}
 }
 
@@ -789,6 +797,14 @@ func (p *progressBarManager) notifyProgress(filename string, bar *progressbar.Pr
 			p.notify.Notify("Uploading "+filename, fmt.Sprintf("%.1f%% complete\nSpeed: %s", current*100, speedStr), 5)
 			lastPercent = current
 			lastBalloon = time.Now()
+		}
+
+		// send stats to tray (non-blocking)
+		if p.statsCh != nil {
+			select {
+			case p.statsCh <- UploadStat{Filename: filename, Speed: speedStr, Percent: current}:
+			default:
+			}
 		}
 
 		if current >= 1.0 {

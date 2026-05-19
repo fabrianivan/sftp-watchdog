@@ -11,9 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/getlantern/systray"
-
-	"SFTPUpload/assets"
 	"SFTPUpload/internal/config"
 	"SFTPUpload/internal/logging"
 	"SFTPUpload/internal/notifier"
@@ -28,6 +25,8 @@ func main() {
 	scanOnce := flag.Bool("scan", false, "Run a single scan (synchronous) and exit; no tray")
 	configPath := flag.String("config", "config.json", "Path to config file")
 	noTray := flag.Bool("no-tray", false, "Run without tray")
+	// simulate-upload: when set, send fake upload stats to exercise tray/logger without SFTP
+	simulate := flag.Bool("simulate-upload", false, "Simulate an upload and show bandwidth stats in the tray (no SFTP)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -73,7 +72,26 @@ func main() {
 		logger.Write("Loaded upload history with %d processed files", len(uploadedFiles.Files))
 	}
 
-	svc := service.New(cfg, srcMgr, dstMgr, uploadedFiles, notify, logger, progressOutput)
+	// channel for upload stats to be shown in tray
+	statsCh := make(chan service.UploadStat, 64)
+	svc := service.New(cfg, srcMgr, dstMgr, uploadedFiles, notify, logger, progressOutput, statsCh)
+
+	// If requested, simulate an upload by sending incremental stats to the stats channel
+	if *simulate {
+		go func() {
+			fn := "simulated-file.dat"
+			for i := 0; i <= 100; i += 10 {
+				speed := "0 B/s"
+				if i > 0 {
+					speed = fmt.Sprintf("%d KB/s", 50+i)
+				}
+				statsCh <- service.UploadStat{Filename: fn, Speed: speed, Percent: float64(i) / 100.0}
+				time.Sleep(1 * time.Second)
+			}
+			// close channel after simulation
+			close(statsCh)
+		}()
+	}
 
 	logger.Write("=== SFTP Watchdog Starting (version %s) ===", version)
 
@@ -132,7 +150,7 @@ func main() {
 	svc.Start(stopCh)
 
 	if !*noTray {
-		startTray(svc, cfg, logger)
+		startTray(svc, cfg, logger, statsCh)
 		notify.Notify("SFTP Uploader Started", "File monitoring is now active and will run indefinitely", 5)
 	}
 
@@ -154,42 +172,6 @@ func main() {
 
 	saveUploads(uploadedFiles, logger)
 	logger.Write("=== Program exited gracefully ===")
-}
-
-func startTray(svc *service.Service, cfg *config.Config, logger *logging.Logger) {
-	go systray.Run(func() {
-		systray.SetTitle("SFTP Uploader")
-		systray.SetTooltip("File monitoring service")
-
-		iconData, err := os.ReadFile("assets/logo.ico")
-		if err != nil && len(assets.Logo) > 0 {
-			iconData = assets.Logo
-		}
-		if len(iconData) > 0 {
-			systray.SetIcon(iconData)
-		}
-
-		mScan := systray.AddMenuItem("Scan Now", "Run a scan immediately")
-		mLogs := systray.AddMenuItem("Show Logs", "Open log file")
-		systray.AddSeparator()
-		mExit := systray.AddMenuItem("Exit", "Quit the app")
-
-		for {
-			select {
-			case <-mScan.ClickedCh:
-				logger.Write("Manual scan triggered from tray")
-				svc.ScanNow()
-			case <-mLogs.ClickedCh:
-				openLogFile(cfg.LogFile, logger)
-			case <-mExit.ClickedCh:
-				logger.Write("Exit requested from tray")
-				systray.Quit()
-				return
-			}
-		}
-	}, func() {
-		logger.Write("Tray exited")
-	})
 }
 
 func openLogFile(path string, logger *logging.Logger) {
