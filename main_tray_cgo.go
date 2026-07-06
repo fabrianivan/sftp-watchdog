@@ -36,6 +36,12 @@ func startTray(svc *service.Service, cfg *config.Config, logger *logging.Logger,
 
 		// listen for upload stats and update/create menu entries
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Write("PANIC in tray stats listener: %v", r)
+				}
+			}()
+
 			for stat := range statsCh {
 				title := fmt.Sprintf("%s — %s — %.1f%%", stat.Filename, stat.Speed, stat.Percent*100)
 				if it, ok := uploadItems[stat.Filename]; ok {

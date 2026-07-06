@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -89,7 +90,13 @@ func (s *Service) scheduleScans(stopCh <-chan struct{}) {
 			s.logger.Write("Stopping scheduled scans")
 			return
 		case <-ticker.C:
-			go func() {
+		go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.logger.Write("PANIC in scheduled scan: %v\n%s", r, debug.Stack())
+					}
+				}()
+
 				if s.cfg.ActiveSchedule.Enabled && !isWithinActiveSchedule(s.cfg.ActiveSchedule, s.logger) {
 					s.logger.Write("Outside active schedule window → skipping scan.")
 					return
@@ -142,6 +149,12 @@ func (s *Service) scheduleScans(stopCh <-chan struct{}) {
 
 		case <-s.scanNowCh:
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.logger.Write("PANIC in manual scan: %v\n%s", r, debug.Stack())
+					}
+				}()
+
 				if !s.tryLockScan() {
 					s.logger.Write("Manual scan skipped — another scan already running.")
 					s.notifier.Notify("Scan Busy", "A scan is already in progress. Please wait.", 5)
@@ -316,6 +329,12 @@ func (s *Service) tryLockScan() bool {
 }
 
 func (s *Service) ProcessFile(remotePath string) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Write("PANIC in ProcessFile(%s): %v\n%s", remotePath, r, debug.Stack())
+		}
+	}()
+
 	s.logger.Write("=== STARTING FILE PROCESSING: %s ===", remotePath)
 
 	srcClient, err := s.srcMgr.GetClient()
@@ -672,6 +691,12 @@ func testSFTPConnection(mgr *sftpclient.Manager, name string, logger *logging.Lo
 }
 
 func testSFTPCapabilities(mgr *sftpclient.Manager, name string, logger *logging.Logger) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Write("PANIC in testSFTPCapabilities(%s): %v\n%s", name, r, debug.Stack())
+		}
+	}()
+
 	client, err := mgr.GetClient()
 	if err != nil {
 		logger.Write("ERROR: Cannot test %s SFTP capabilities: %v", name, err)
@@ -773,6 +798,12 @@ func (p *progressBarManager) CreateBar(filename string, size int64) *progressbar
 }
 
 func (p *progressBarManager) notifyProgress(filename string, bar *progressbar.ProgressBar) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Write("PANIC in notifyProgress(%s): %v\n%s", filename, r, debug.Stack())
+		}
+	}()
+
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 

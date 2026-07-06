@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -22,6 +23,13 @@ import (
 var version = "dev"
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "FATAL PANIC: %v\n%s\n", r, debug.Stack())
+			os.Exit(1)
+		}
+	}()
+
 	scanOnce := flag.Bool("scan", false, "Run a single scan (synchronous) and exit; no tray")
 	configPath := flag.String("config", "config.json", "Path to config file")
 	noTray := flag.Bool("no-tray", false, "Run without tray")
@@ -95,6 +103,17 @@ func main() {
 
 	logger.Write("=== SFTP Watchdog Starting (version %s) ===", version)
 
+	// Defer cleanup: resources will be closed in reverse order
+	defer func() {
+		logger.Write("Closing SFTP connections...")
+		srcMgr.Close()
+		if dstMgr != nil {
+			dstMgr.Close()
+		}
+		saveUploads(uploadedFiles, logger)
+		logger.Write("=== Program exited gracefully ===")
+	}()
+
 	if err := srcMgr.Connect(); err != nil {
 		logger.Write("ERROR: Source SFTP initial connect failed: %v", err)
 		if err := srcMgr.RetryConnect(); err != nil {
@@ -129,11 +148,6 @@ func main() {
 	if *scanOnce {
 		logger.Write("=== SFTP Watchdog: SINGLE-SCAN MODE (version %s) ===", version)
 		svc.RunImmediateScan()
-		saveUploads(uploadedFiles, logger)
-		srcMgr.Close()
-		if dstMgr != nil {
-			dstMgr.Close()
-		}
 		logger.Write("=== Single scan completed; exiting. ===")
 		return
 	}
@@ -163,15 +177,6 @@ func main() {
 	logger.Write("=== Termination signal received, stopping services... ===")
 	close(stopCh)
 	time.Sleep(2 * time.Second)
-
-	logger.Write("Closing SFTP connections...")
-	srcMgr.Close()
-	if dstMgr != nil {
-		dstMgr.Close()
-	}
-
-	saveUploads(uploadedFiles, logger)
-	logger.Write("=== Program exited gracefully ===")
 }
 
 func openLogFile(path string, logger *logging.Logger) {

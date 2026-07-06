@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -139,6 +140,12 @@ func (m *Manager) Connect() error {
 }
 
 func (m *Manager) keepAliveLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Write("PANIC in keepAliveLoop for %s: %v\n%s", m.cfg.Host, r, debug.Stack())
+		}
+	}()
+
 	interval := 30 * time.Second
 	if m.keepAliveDuration > 0 {
 		interval = m.keepAliveDuration
@@ -214,7 +221,13 @@ func (m *Manager) GetClient() (*sftp.Client, error) {
 		m.Close()
 	}
 
+	var attempts int
 	for {
+		attempts++
+		if attempts > m.retries*3 {
+			return nil, fmt.Errorf("exceeded maximum reconnect attempts (%d) for %s", attempts-1, m.cfg.Host)
+		}
+
 		err := m.RetryConnect()
 		if err != nil {
 			m.logger.Write("Reconnect failed (%s): %v. Retrying in %ds...", m.cfg.Host, err, m.interval)
@@ -266,12 +279,15 @@ func EnsureDirWritable(client *sftp.Client, dir string, logger *logging.Logger) 
 		logger.Write("ERROR: creating test file %s failed: %v", testFile, err)
 		return fmt.Errorf("cannot create test file %s: %w", testFile, err)
 	}
-	_, _ = f.Write([]byte("permtest"))
-	f.Close()
+	defer func() {
+		f.Close()
+		if err := client.Remove(testFile); err != nil {
+			logger.Write("WARNING: created test file %s but failed to remove: %v", testFile, err)
+		}
+	}()
 
-	if err := client.Remove(testFile); err != nil {
-		logger.Write("WARNING: created test file %s but failed to remove: %v", testFile, err)
-	}
+	_, _ = f.Write([]byte("permtest"))
+
 	logger.Write("Directory %s exists and is writable (test file created and removed).", dir)
 	return nil
 }

@@ -38,6 +38,12 @@ func Init(basePath string, retentionDays int) (*Logger, error) {
 }
 
 func (l *Logger) cleanupLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "PANIC in log cleanup goroutine: %v\n", r)
+		}
+	}()
+
 	for {
 		time.Sleep(24 * time.Hour)
 		l.cleanupOldLogs()
@@ -74,6 +80,12 @@ func (l *Logger) openDailyLogFile() error {
 }
 
 func (l *Logger) Write(format string, a ...interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "PANIC in logger.Write: %v\n", r)
+		}
+	}()
+
 	now := time.Now()
 	today := now.Format("2006-01-02")
 

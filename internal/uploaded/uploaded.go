@@ -69,18 +69,24 @@ func (u *Files) Save() error {
 
 	u.mu.Lock()
 	defer u.mu.Unlock()
+
 	tmp := u.Path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(u.Files); err != nil {
-		f.Close()
 		return err
 	}
-	f.Close()
+
+	if err := f.Close(); err != nil {
+		return err
+	}
+
 	return os.Rename(tmp, u.Path)
 }
 
