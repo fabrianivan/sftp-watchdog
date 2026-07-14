@@ -69,15 +69,42 @@ func (d *Dashboard) Container() *fyne.Container {
 }
 
 func (d *Dashboard) buildUI() {
+	// === Header Section ===
+	title := canvas.NewText("SFTP WATCHDOG", ColorIndigo)
+	title.TextSize = 24
+	title.TextStyle = fyne.TextStyle{Bold: true}
+
+	subtitle := canvas.NewText("Automated File Transfer Monitor & Sync Utility", ColorMuted)
+	subtitle.TextSize = 12
+
+	var headerLogo fyne.CanvasObject
+	logoImg := canvas.NewImageFromFile("assets/logo.png")
+	if logoImg != nil {
+		logoImg.FillMode = canvas.ImageFillContain
+		logoImg.SetMinSize(fyne.NewSize(50, 50))
+		headerLogo = logoImg
+	} else {
+		headerLogo = canvas.NewCircle(ColorIndigo)
+		headerLogo.Resize(fyne.NewSize(50, 50))
+	}
+
+	headerText := container.NewVBox(title, subtitle)
+	header := container.NewHBox(
+		headerLogo,
+		layout.NewSpacer(),
+		headerText,
+		layout.NewSpacer(),
+	)
+
 	// === Connection Status ===
 	d.srcStatus = canvas.NewCircle(ColorMuted)
-	d.srcStatus.Resize(fyne.NewSize(14, 14))
-	d.srcLabel = widget.NewLabel("Source: Not connected")
+	d.srcStatus.Resize(fyne.NewSize(12, 12))
+	d.srcLabel = widget.NewLabel("Source: Connecting...")
 	d.srcLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 	d.dstStatus = canvas.NewCircle(ColorMuted)
-	d.dstStatus.Resize(fyne.NewSize(14, 14))
-	d.dstLabel = widget.NewLabel("Destination: Not connected")
+	d.dstStatus.Resize(fyne.NewSize(12, 12))
+	d.dstLabel = widget.NewLabel("Destination: Connecting...")
 	d.dstLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 	srcRow := container.NewHBox(
@@ -89,7 +116,7 @@ func (d *Dashboard) buildUI() {
 		d.dstLabel,
 	)
 
-	connectionCard := widget.NewCard("Connection Status", "", container.NewVBox(srcRow, dstRow))
+	connectionCard := widget.NewCard("Connection Status", "Monitor SFTP server connectivity", container.NewVBox(srcRow, dstRow))
 
 	// === Scanner Status ===
 	d.scannerStatus = widget.NewLabel("Scanner: Stopped")
@@ -99,7 +126,7 @@ func (d *Dashboard) buildUI() {
 	d.nextScanLabel = widget.NewLabel("Poll interval: —")
 	d.filesLabel = widget.NewLabel("Files processed: 0")
 	d.scheduleLabel = widget.NewLabel("Schedule: —")
-	d.eventLabel = widget.NewLabel("")
+	d.eventLabel = widget.NewLabel("Waiting for action...")
 
 	// Update schedule label
 	if d.cfg.ActiveSchedule.Enabled {
@@ -111,7 +138,7 @@ func (d *Dashboard) buildUI() {
 
 	d.nextScanLabel.SetText(fmt.Sprintf("Poll interval: %ds", d.cfg.PollInterval))
 
-	statusCard := widget.NewCard("Scanner", "", container.NewVBox(
+	statusCard := widget.NewCard("Scanner Status", "Scheduler activity tracking", container.NewVBox(
 		d.scannerStatus,
 		d.lastScanLabel,
 		d.nextScanLabel,
@@ -120,44 +147,56 @@ func (d *Dashboard) buildUI() {
 	))
 
 	// === Controls ===
-	d.toggleBtn = widget.NewButtonWithIcon("▶  Start Scanner", theme.MediaPlayIcon(), func() {
+	d.toggleBtn = widget.NewButtonWithIcon("Start Scanner", theme.MediaPlayIcon(), func() {
 		if d.svc.IsRunning() {
 			d.svc.Stop()
-			d.toggleBtn.SetText("▶  Start Scanner")
+			d.toggleBtn.SetText("Start Scanner")
 			d.toggleBtn.SetIcon(theme.MediaPlayIcon())
+			d.toggleBtn.Importance = widget.HighImportance
 			d.scannerStatus.SetText("Scanner: Stopped")
 		} else {
 			d.svc.Start()
-			d.toggleBtn.SetText("⏹  Stop Scanner")
+			d.toggleBtn.SetText("Stop Scanner")
 			d.toggleBtn.SetIcon(theme.MediaStopIcon())
+			d.toggleBtn.Importance = widget.DangerImportance
 			d.scannerStatus.SetText("Scanner: Running")
 		}
 	})
 	d.toggleBtn.Importance = widget.HighImportance
 
-	d.scanBtn = widget.NewButtonWithIcon("🔍  Scan Now", theme.SearchIcon(), func() {
+	d.scanBtn = widget.NewButtonWithIcon("Scan Now", theme.SearchIcon(), func() {
 		d.svc.ScanNow()
 		d.eventLabel.SetText("Manual scan triggered...")
 	})
 
-	controlsCard := widget.NewCard("Controls", "", container.NewVBox(
+	controlsCard := widget.NewCard("Control Panel", "Manual scheduler controls", container.NewVBox(
 		container.NewGridWithColumns(2, d.toggleBtn, d.scanBtn),
 	))
 
 	// === Upload Progress ===
 	d.progressBox = container.NewVBox()
-	progressCard := widget.NewCard("Active Uploads", "", d.progressBox)
+	progressCard := widget.NewCard("Active File Transfers", "Real-time sync progress", d.progressBox)
 
 	// === Event Display ===
-	eventCard := widget.NewCard("Latest Event", "", d.eventLabel)
+	eventCard := widget.NewCard("Recent Activity", "Log snapshot", d.eventLabel)
 
-	// === Layout ===
-	content := container.NewVBox(
+	// === 2-Column Dashboard Layout ===
+	leftCol := container.NewVBox(
 		connectionCard,
 		statusCard,
 		controlsCard,
+	)
+	rightCol := container.NewVBox(
 		progressCard,
 		eventCard,
+	)
+
+	dashboardGrid := container.New(layout.NewGridLayout(2), leftCol, rightCol)
+
+	content := container.NewVBox(
+		header,
+		widget.NewSeparator(),
+		dashboardGrid,
 		layout.NewSpacer(),
 	)
 
@@ -181,7 +220,6 @@ func (d *Dashboard) listenEvents() {
 			d.filesProcessed++
 			d.filesLabel.SetText(fmt.Sprintf("Files processed: %d", d.filesProcessed))
 			d.eventLabel.SetText("✅ Uploaded: " + event.Message)
-			// Remove progress bar
 			d.removeProgressBar(event.Message)
 		case "upload_fail":
 			d.eventLabel.SetText("❌ Failed: " + event.Message)
@@ -219,7 +257,6 @@ func (d *Dashboard) listenStats() {
 func (d *Dashboard) removeProgressBar(filename string) {
 	if _, exists := d.progressBars[filename]; exists {
 		delete(d.progressBars, filename)
-		// Rebuild progress box
 		d.progressBox.RemoveAll()
 		for fn, bar := range d.progressBars {
 			d.progressBox.Add(container.NewVBox(
@@ -235,7 +272,6 @@ func (d *Dashboard) updateLoop() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Update connection indicators
 		if d.svc.SourceConnected() {
 			d.srcStatus.FillColor = ColorGreen
 			d.srcLabel.SetText(fmt.Sprintf("Source: %s ● Connected", d.cfg.SourceSFTP.Host))
@@ -257,15 +293,17 @@ func (d *Dashboard) updateLoop() {
 		}
 		d.dstStatus.Refresh()
 
-		// Update scanner status
 		if d.svc.IsRunning() {
 			d.scannerStatus.SetText("Scanner: Running")
-			d.toggleBtn.SetText("⏹  Stop Scanner")
+			d.toggleBtn.SetText("Stop Scanner")
 			d.toggleBtn.SetIcon(theme.MediaStopIcon())
+			d.toggleBtn.Importance = widget.DangerImportance
 		} else {
 			d.scannerStatus.SetText("Scanner: Stopped")
-			d.toggleBtn.SetText("▶  Start Scanner")
+			d.toggleBtn.SetText("Start Scanner")
 			d.toggleBtn.SetIcon(theme.MediaPlayIcon())
+			d.toggleBtn.Importance = widget.HighImportance
 		}
 	}
 }
+

@@ -1,2 +1,15 @@
 .cache
 .build
+
+# Binaries and packaging
+dist/
+*.app/
+*.exe
+*.dmg
+*.syso
+
+# Logs
+*.log
+
+# History
+uploaded.json
