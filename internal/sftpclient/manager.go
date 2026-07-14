@@ -20,6 +20,7 @@ import (
 	"SFTPUpload/internal/notifier"
 )
 
+// Manager manages a single SFTP connection with reconnect and keepalive.
 type Manager struct {
 	cfg               config.SFTPConfig
 	logger            *logging.Logger
@@ -37,6 +38,7 @@ type Manager struct {
 	uploadMu          sync.Mutex
 }
 
+// NewManager creates a Manager for the given SFTP endpoint.
 func NewManager(cfg config.SFTPConfig, retries, interval, idleTimeout, keepAliveSeconds int, logger *logging.Logger, notifier notifier.Notifier) *Manager {
 	return &Manager{
 		cfg:               cfg,
@@ -50,15 +52,20 @@ func NewManager(cfg config.SFTPConfig, retries, interval, idleTimeout, keepAlive
 	}
 }
 
+// AcquireUpload locks the upload mutex.
 func (m *Manager) AcquireUpload() { m.uploadMu.Lock() }
+
+// ReleaseUpload unlocks the upload mutex.
 func (m *Manager) ReleaseUpload() { m.uploadMu.Unlock() }
 
+// IsConnected reports whether a live SFTP client exists.
 func (m *Manager) IsConnected() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.client != nil
 }
 
+// IsIdle reports whether the connection has been idle past the timeout.
 func (m *Manager) IsIdle() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -68,6 +75,7 @@ func (m *Manager) IsIdle() bool {
 	return time.Since(m.lastActivity) > time.Duration(m.idleTimeout)*time.Second
 }
 
+// Connect establishes a new SSH+SFTP connection if one doesn't exist.
 func (m *Manager) Connect() error {
 	m.connectingMu.Lock()
 	defer m.connectingMu.Unlock()
@@ -81,14 +89,17 @@ func (m *Manager) Connect() error {
 
 	var hostKeyCallback ssh.HostKeyCallback
 	if m.cfg.ExpectedFingerprint != "" {
-		hostKeyCallback = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			actualFingerprint := ssh.FingerprintSHA256(key)
-			if actualFingerprint != m.cfg.ExpectedFingerprint {
-				return fmt.Errorf("host key fingerprint mismatch: expected %s, got %s", m.cfg.ExpectedFingerprint, actualFingerprint)
+		expected := m.cfg.ExpectedFingerprint
+		hostKeyCallback = func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			actual := ssh.FingerprintSHA256(key)
+			if actual != expected {
+				return fmt.Errorf("host key fingerprint mismatch: expected %s, got %s", expected, actual)
 			}
 			return nil
 		}
 	} else {
+		// TODO(security): InsecureIgnoreHostKey should be replaced with
+		// known_hosts verification in production environments.
 		hostKeyCallback = ssh.InsecureIgnoreHostKey()
 	}
 
@@ -119,13 +130,13 @@ func (m *Manager) Connect() error {
 
 	m.mu.Lock()
 	if m.client != nil {
+		// Another goroutine connected while we were dialing
 		_ = client.Close()
 		_ = sshConn.Close()
 		m.mu.Unlock()
-		m.logger.Write("Connect(): connection created but a client already exists; discarding new connection")
+		m.logger.Write("Connect(): discarding duplicate connection")
 		return nil
 	}
-
 	m.sshConn = sshConn
 	m.client = client
 	m.lastActivity = time.Now()
@@ -157,10 +168,10 @@ func (m *Manager) keepAliveLoop() {
 	for range ticker.C {
 		m.mu.Lock()
 		sshConn := m.sshConn
-		clientAlive := m.client != nil && sshConn != nil
+		alive := m.client != nil && sshConn != nil
 		m.mu.Unlock()
 
-		if !clientAlive {
+		if !alive {
 			return
 		}
 
@@ -169,7 +180,7 @@ func (m *Manager) keepAliveLoop() {
 			if err != nil {
 				m.logger.Write("Keepalive failed for %s: %v (will reconnect soon)", m.cfg.Host, err)
 				m.Close()
-				go m.RetryConnect()
+				go func() { _ = m.RetryConnect() }()
 				return
 			}
 			m.logger.Write("Keepalive OK for %s", m.cfg.Host)
@@ -177,6 +188,7 @@ func (m *Manager) keepAliveLoop() {
 	}
 }
 
+// Close tears down the SFTP and SSH connections.
 func (m *Manager) Close() {
 	m.uploadMu.Lock()
 	defer m.uploadMu.Unlock()
@@ -200,12 +212,14 @@ func (m *Manager) Close() {
 	}
 }
 
+// UpdateActivity refreshes the last-activity timestamp.
 func (m *Manager) UpdateActivity() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastActivity = time.Now()
 }
 
+// GetClient returns a live SFTP client, reconnecting if necessary.
 func (m *Manager) GetClient() (*sftp.Client, error) {
 	m.mu.Lock()
 	c := m.client
@@ -215,9 +229,8 @@ func (m *Manager) GetClient() (*sftp.Client, error) {
 		if _, err := c.Stat("."); err == nil {
 			m.UpdateActivity()
 			return c, nil
-		} else {
-			m.logger.Write("SFTP client appears dead (%s): %v", m.cfg.Host, err)
 		}
+		m.logger.Write("SFTP client appears dead (%s): reconnecting...", m.cfg.Host)
 		m.Close()
 	}
 
@@ -228,8 +241,7 @@ func (m *Manager) GetClient() (*sftp.Client, error) {
 			return nil, fmt.Errorf("exceeded maximum reconnect attempts (%d) for %s", attempts-1, m.cfg.Host)
 		}
 
-		err := m.RetryConnect()
-		if err != nil {
+		if err := m.RetryConnect(); err != nil {
 			m.logger.Write("Reconnect failed (%s): %v. Retrying in %ds...", m.cfg.Host, err, m.interval)
 			time.Sleep(time.Duration(m.interval) * time.Second)
 			continue
@@ -246,7 +258,7 @@ func (m *Manager) GetClient() (*sftp.Client, error) {
 		}
 
 		if _, err := c.Stat("."); err != nil {
-			m.logger.Write("New client test failed (%s): %v. Closing and retrying...", m.cfg.Host, err)
+			m.logger.Write("New client test failed (%s): %v. Retrying...", m.cfg.Host, err)
 			m.Close()
 			time.Sleep(time.Duration(m.interval) * time.Second)
 			continue
@@ -258,6 +270,7 @@ func (m *Manager) GetClient() (*sftp.Client, error) {
 	}
 }
 
+// MoveFile renames a remote file.
 func (m *Manager) MoveFile(src, dst string) error {
 	client, err := m.GetClient()
 	if err != nil {
@@ -266,6 +279,7 @@ func (m *Manager) MoveFile(src, dst string) error {
 	return client.Rename(src, dst)
 }
 
+// EnsureDirWritable creates a directory and verifies it's writable.
 func EnsureDirWritable(client *sftp.Client, dir string, logger *logging.Logger) error {
 	dir = filepath.ToSlash(dir)
 	if err := client.MkdirAll(dir); err != nil {
@@ -288,10 +302,11 @@ func EnsureDirWritable(client *sftp.Client, dir string, logger *logging.Logger) 
 
 	_, _ = f.Write([]byte("permtest"))
 
-	logger.Write("Directory %s exists and is writable (test file created and removed).", dir)
+	logger.Write("Directory %s exists and is writable", dir)
 	return nil
 }
 
+// MoveRemoteToBackup moves a file to the backup directory, handling name collisions.
 func (m *Manager) MoveRemoteToBackup(remotePath, backupPath string) error {
 	client, err := m.GetClient()
 	if err != nil {
@@ -311,6 +326,7 @@ func (m *Manager) MoveRemoteToBackup(remotePath, backupPath string) error {
 		return err
 	}
 
+	// Handle name collision by appending a counter
 	originalBackupPath := backupPath
 	counter := 1
 	for {
@@ -333,6 +349,7 @@ func (m *Manager) MoveRemoteToBackup(remotePath, backupPath string) error {
 	return nil
 }
 
+// RetryConnect attempts to reconnect with exponential backoff.
 func (m *Manager) RetryConnect() error {
 	m.connectingMu.Lock()
 	defer m.connectingMu.Unlock()
@@ -349,18 +366,15 @@ func (m *Manager) RetryConnect() error {
 		m.Close()
 	}
 
-	retries := m.retries
-	interval := m.interval
-
 	var lastErr error
-	for i := 0; i < retries; i++ {
-		m.logger.Write("Reconnect attempt %d/%d to %s ...", i+1, retries, m.cfg.Host)
+	for i := 0; i < m.retries; i++ {
+		m.logger.Write("Reconnect attempt %d/%d to %s ...", i+1, m.retries, m.cfg.Host)
 
 		if err := m.Connect(); err != nil {
 			lastErr = err
 			m.logger.Write("Reconnect attempt %d failed: %v", i+1, err)
 
-			sleepSec := time.Duration(interval) * time.Second * time.Duration(1<<i)
+			sleepSec := time.Duration(m.interval) * time.Second * time.Duration(1<<i)
 			if sleepSec > 60*time.Second {
 				sleepSec = 60 * time.Second
 			}
@@ -375,7 +389,7 @@ func (m *Manager) RetryConnect() error {
 
 		if c == nil {
 			lastErr = fmt.Errorf("connect succeeded but client is nil")
-			time.Sleep(time.Duration(interval) * time.Second)
+			time.Sleep(time.Duration(m.interval) * time.Second)
 			continue
 		}
 
@@ -383,7 +397,7 @@ func (m *Manager) RetryConnect() error {
 			lastErr = err
 			m.logger.Write("Post-connect stat failed: %v", err)
 			m.Close()
-			time.Sleep(time.Duration(interval) * time.Second)
+			time.Sleep(time.Duration(m.interval) * time.Second)
 			continue
 		}
 
@@ -391,16 +405,19 @@ func (m *Manager) RetryConnect() error {
 		return nil
 	}
 
-	return fmt.Errorf("all %d reconnect attempts failed: %v", retries, lastErr)
+	return fmt.Errorf("all %d reconnect attempts failed: %v", m.retries, lastErr)
 }
 
+// MonitorIdle watches for idle connections and closes them automatically.
 func (m *Manager) MonitorIdle(stopCh <-chan struct{}) {
 	idle := time.Duration(m.idleTimeout) * time.Second
 	if idle <= 0 {
 		return
 	}
+
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-stopCh:
@@ -410,20 +427,23 @@ func (m *Manager) MonitorIdle(stopCh <-chan struct{}) {
 			last := m.lastActivity
 			connected := m.client != nil
 			m.mu.Unlock()
+
 			if connected && time.Since(last) > idle {
-				m.logger.Write("Idle timeout reached for %s (%s) -> closing connection", m.cfg.Host, time.Since(last))
+				m.logger.Write("Idle timeout reached for %s (%s) -> closing", m.cfg.Host, time.Since(last))
 				m.Close()
 			}
 		}
 	}
 }
 
+// ComputeRemoteFileHash computes a SHA-256 hash of a remote file.
 func ComputeRemoteFileHash(client *sftp.Client, remotePath string) (string, error) {
 	f, err := client.Open(remotePath)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -431,21 +451,23 @@ func ComputeRemoteFileHash(client *sftp.Client, remotePath string) (string, erro
 	return base64.StdEncoding.EncodeToString(h.Sum(nil)), nil
 }
 
+// TransferSpeed formats a byte count over a time window as a human-readable speed.
 func TransferSpeed(bytes, windowSeconds int64) string {
 	if windowSeconds <= 0 {
 		return "0 B/s"
 	}
-	speedPerSec := float64(bytes) / float64(windowSeconds)
+	speed := float64(bytes) / float64(windowSeconds)
 	switch {
-	case speedPerSec < 1024:
-		return fmt.Sprintf("%.1f B/s", speedPerSec)
-	case speedPerSec < 1024*1024:
-		return fmt.Sprintf("%.1f KB/s", speedPerSec/1024)
+	case speed < 1024:
+		return fmt.Sprintf("%.1f B/s", speed)
+	case speed < 1024*1024:
+		return fmt.Sprintf("%.1f KB/s", speed/1024)
 	default:
-		return fmt.Sprintf("%.1f MB/s", speedPerSec/(1024*1024))
+		return fmt.Sprintf("%.1f MB/s", speed/(1024*1024))
 	}
 }
 
+// IsNaN reports whether f is IEEE 754 "not-a-number".
 func IsNaN(f float64) bool {
 	return math.IsNaN(f)
 }

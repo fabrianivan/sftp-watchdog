@@ -2,10 +2,10 @@
 setlocal enabledelayedexpansion
 
 REM ==========================================================
-REM  🚀 Go SFTP Uploader Auto Build Script
+REM  🚀 SFTP Watchdog Windows Build Script
 REM  - Auto-increments build version in versioninfo.json
 REM  - Embeds icon + manifest
-REM  - Builds hidden-window EXE (tray app)
+REM  - Builds hidden-window EXE (GUI app)
 REM  - Optional UPX compression
 REM ==========================================================
 
@@ -41,14 +41,14 @@ if not exist "%VERSION_FILE%" (
     echo     "FileVersion": {"Major":1,"Minor":0,"Patch":0,"Build":0}, >> "%VERSION_FILE%"
     echo     "ProductVersion": {"Major":1,"Minor":0,"Patch":0,"Build":0} >> "%VERSION_FILE%"
     echo   }, >> "%VERSION_FILE%"
-    echo   "StringFileInfo": {"FileDescription":"SFTP File Uploader","ProductName":"SFTP Uploader"}, >> "%VERSION_FILE%"
+    echo   "StringFileInfo": {"FileDescription":"SFTP Watchdog","ProductName":"SFTP Watchdog"}, >> "%VERSION_FILE%"
     echo   "IconPath":"assets/logo.ico" >> "%VERSION_FILE%"
     echo } >> "%VERSION_FILE%"
 )
 
 echo [*] Reading current version from %VERSION_FILE%...
 
-for /f "tokens=1-4 delims=:.," %%a in ('findstr /i "Build" "%VERSION_FILE%" ^| findstr /v "ProductVersion"') do (
+for /f "tokens=1-4 delims=:.,," %%a in ('findstr /i "Build" "%VERSION_FILE%" ^| findstr /v "ProductVersion"') do (
     set /a BUILD_NUM=%%b
 )
 
@@ -66,7 +66,10 @@ goversioninfo -icon="%ICON_FILE%" -manifest="%MANIFEST_FILE%" -64=true
 
 REM --- Step 6: Build EXE ---
 echo [*] Compiling Go executable...
-go build -ldflags="-H=windowsgui -s -w" -o "%OUTPUT_DIR%\%APP_NAME%_%BUILD_TIME%.exe" ./cmd/uploader
+set CGO_ENABLED=1
+set GOOS=windows
+set GOARCH=amd64
+go build -ldflags="-H=windowsgui -s -w" -o "%OUTPUT_DIR%\%APP_NAME%_%BUILD_TIME%.exe" .
 
 if %errorlevel% neq 0 (
     echo [!] ❌ Build failed. Check your Go code.

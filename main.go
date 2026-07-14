@@ -3,14 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"os/signal"
-	"runtime"
 	"runtime/debug"
 	"syscall"
 	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
 
 	"SFTPUpload/internal/config"
 	"SFTPUpload/internal/logging"
@@ -18,6 +18,7 @@ import (
 	"SFTPUpload/internal/service"
 	"SFTPUpload/internal/sftpclient"
 	"SFTPUpload/internal/uploaded"
+	"SFTPUpload/ui"
 )
 
 var version = "dev"
@@ -30,13 +31,11 @@ func main() {
 		}
 	}()
 
-	scanOnce := flag.Bool("scan", false, "Run a single scan (synchronous) and exit; no tray")
+	scanOnce := flag.Bool("scan", false, "Run a single scan (headless) and exit")
 	configPath := flag.String("config", "config.json", "Path to config file")
-	noTray := flag.Bool("no-tray", false, "Run without tray")
-	// simulate-upload: when set, send fake upload stats to exercise tray/logger without SFTP
-	simulate := flag.Bool("simulate-upload", false, "Simulate an upload and show bandwidth stats in the tray (no SFTP)")
 	flag.Parse()
 
+	// Load or create config
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -51,6 +50,7 @@ func main() {
 		return
 	}
 
+	// Initialize logger
 	logger, err := logging.Init(cfg.LogFile, cfg.LogRetentionDays)
 	if err != nil {
 		fmt.Printf("Failed to initialize log: %v\n", err)
@@ -58,146 +58,116 @@ func main() {
 	}
 	defer logger.Close()
 
-	progressOutput := io.Discard
-	if *scanOnce {
-		progressOutput = os.Stdout
-	}
+	logger.Write("=== SFTP Watchdog Starting (version %s) ===", version)
 
-	notify := notifier.BeeepNotifier{}
-
-	srcMgr := sftpclient.NewManager(cfg.SourceSFTP, cfg.ReconnectRetries, cfg.ReconnectInterval, cfg.IdleTimeoutSeconds, cfg.KeepAliveDuration, logger, notify)
+	// Create SFTP managers
+	noopNotify := notifier.NoopNotifier{}
+	srcMgr := sftpclient.NewManager(cfg.SourceSFTP, cfg.ReconnectRetries, cfg.ReconnectInterval, cfg.IdleTimeoutSeconds, cfg.KeepAliveDuration, logger, noopNotify)
 	var dstMgr *sftpclient.Manager
 	if cfg.TargetSFTP.Host != "" {
-		dstMgr = sftpclient.NewManager(cfg.TargetSFTP, cfg.ReconnectRetries, cfg.ReconnectInterval, cfg.IdleTimeoutSeconds, cfg.KeepAliveDuration, logger, notify)
+		dstMgr = sftpclient.NewManager(cfg.TargetSFTP, cfg.ReconnectRetries, cfg.ReconnectInterval, cfg.IdleTimeoutSeconds, cfg.KeepAliveDuration, logger, noopNotify)
 	}
 
+	// Load upload history
 	uploadedFiles := uploaded.New("uploaded.json")
 	if err := uploadedFiles.Load(); err != nil {
 		logger.Write("WARNING: Failed to load uploaded.json: %v", err)
-		logger.Write("Falling back to in-memory upload tracking; uploaded.json will not be used.")
+		logger.Write("Falling back to in-memory upload tracking")
 		uploadedFiles.DisablePersistence()
 	} else {
 		logger.Write("Loaded upload history with %d processed files", len(uploadedFiles.Files))
 	}
 
-	// channel for upload stats to be shown in tray
-	statsCh := make(chan service.UploadStat, 64)
-	svc := service.New(cfg, srcMgr, dstMgr, uploadedFiles, notify, logger, progressOutput, statsCh)
-
-	// If requested, simulate an upload by sending incremental stats to the stats channel
-	if *simulate {
-		go func() {
-			fn := "simulated-file.dat"
-			for i := 0; i <= 100; i += 10 {
-				speed := "0 B/s"
-				if i > 0 {
-					speed = fmt.Sprintf("%d KB/s", 50+i)
-				}
-				statsCh <- service.UploadStat{Filename: fn, Speed: speed, Percent: float64(i) / 100.0}
-				time.Sleep(1 * time.Second)
-			}
-			// close channel after simulation
-			close(statsCh)
-		}()
-	}
-
-	logger.Write("=== SFTP Watchdog Starting (version %s) ===", version)
-
-	// Defer cleanup: resources will be closed in reverse order
-	defer func() {
-		logger.Write("Closing SFTP connections...")
-		srcMgr.Close()
-		if dstMgr != nil {
-			dstMgr.Close()
-		}
-		saveUploads(uploadedFiles, logger)
-		logger.Write("=== Program exited gracefully ===")
-	}()
-
-	if err := srcMgr.Connect(); err != nil {
-		logger.Write("ERROR: Source SFTP initial connect failed: %v", err)
-		if err := srcMgr.RetryConnect(); err != nil {
-			logger.Write("ERROR: Failed to reconnect source SFTP: %v", err)
-			if *scanOnce {
-				return
-			}
-		}
-	} else {
-		logger.Write("Source SFTP connection established successfully")
-	}
-
-	if dstMgr != nil {
-		if err := dstMgr.Connect(); err != nil {
-			logger.Write("ERROR: Destination SFTP initial connect failed: %v", err)
-			if err := dstMgr.RetryConnect(); err != nil {
-				logger.Write("ERROR: Failed to reconnect destination SFTP: %v", err)
-				if *scanOnce {
-					return
-				}
-			}
-		} else {
-			logger.Write("Destination SFTP connection established successfully")
-		}
-	}
-
-	svc.TestConnections()
-	if err := svc.PrepareDirectories(); err != nil {
-		logger.Write("ERROR: Backup directory setup failed: %v", err)
-	}
-
+	// =========================================
+	// Headless mode: single scan and exit
+	// =========================================
 	if *scanOnce {
-		logger.Write("=== SFTP Watchdog: SINGLE-SCAN MODE (version %s) ===", version)
+		svc := service.New(cfg, srcMgr, dstMgr, uploadedFiles, noopNotify, logger)
+
+		logger.Write("=== SFTP Watchdog: SINGLE-SCAN MODE ===")
+		if err := svc.ConnectAll(); err != nil {
+			logger.Write("ERROR: Failed to connect: %v", err)
+			return
+		}
+		defer svc.CloseAll()
+
+		svc.TestConnections()
+		if err := svc.PrepareDirectories(); err != nil {
+			logger.Write("ERROR: Backup directory setup failed: %v", err)
+		}
 		svc.RunImmediateScan()
 		logger.Write("=== Single scan completed; exiting. ===")
 		return
 	}
 
-	if cfg.EnableInitialSync == nil || *cfg.EnableInitialSync {
-		time.Sleep(2 * time.Second)
-		logger.Write("Running initial scan right after startup...")
-		svc.RunImmediateScan()
-	} else {
-		logger.Write("Initial sync disabled by config → skipping startup scan.")
+	// =========================================
+	// GUI mode: Fyne application
+	// =========================================
+	fyneApp := app.NewWithID("id.fabrianivan.sftpwatchdog")
+	fyneApp.Settings().SetTheme(&ui.WatchdogTheme{})
+
+	// Use Fyne notifier for GUI mode
+	fyneNotify := &fyneDesktopNotifier{fyneApp: fyneApp}
+
+	// Recreate managers with Fyne notifier
+	srcMgr = sftpclient.NewManager(cfg.SourceSFTP, cfg.ReconnectRetries, cfg.ReconnectInterval, cfg.IdleTimeoutSeconds, cfg.KeepAliveDuration, logger, fyneNotify)
+	if cfg.TargetSFTP.Host != "" {
+		dstMgr = sftpclient.NewManager(cfg.TargetSFTP, cfg.ReconnectRetries, cfg.ReconnectInterval, cfg.IdleTimeoutSeconds, cfg.KeepAliveDuration, logger, fyneNotify)
 	}
 
-	stopCh := make(chan struct{})
-	svc.Start(stopCh)
+	svc := service.New(cfg, srcMgr, dstMgr, uploadedFiles, fyneNotify, logger)
 
-	if !*noTray {
-		startTray(svc, cfg, logger, statsCh)
-		notify.Notify("SFTP Uploader Started", "File monitoring is now active and will run indefinitely", 5)
-	}
+	// Connect in background
+	go func() {
+		if err := svc.ConnectAll(); err != nil {
+			logger.Write("WARNING: Initial connection failed: %v", err)
+		}
+		svc.TestConnections()
+		if err := svc.PrepareDirectories(); err != nil {
+			logger.Write("ERROR: Backup directory setup failed: %v", err)
+		}
 
-	logger.Write("Service is now monitoring for files indefinitely")
+		// Auto-start if initial sync is enabled
+		if cfg.EnableInitialSync == nil || *cfg.EnableInitialSync {
+			time.Sleep(2 * time.Second)
+			logger.Write("Running initial scan on startup...")
+			svc.RunImmediateScan()
+		}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		// Start the scanner
+		svc.Start()
+		logger.Write("Scanner started automatically")
+	}()
 
-	<-sigCh
-	logger.Write("=== Termination signal received, stopping services... ===")
-	close(stopCh)
-	time.Sleep(2 * time.Second)
+	// Handle OS signals
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		logger.Write("=== Termination signal received ===")
+		svc.Stop()
+		svc.CloseAll()
+		fyneApp.Quit()
+	}()
+
+	// Create and show GUI
+	mainApp := ui.NewApp(fyneApp, svc, cfg, *configPath, logger, version)
+	mainApp.Show()
+
+	logger.Write("GUI application started")
+	fyneApp.Run()
+
+	// Cleanup after GUI exits
+	svc.Stop()
+	svc.CloseAll()
+	logger.Write("=== Application exited ===")
 }
 
-func openLogFile(path string, logger *logging.Logger) {
-	var cmd *exec.Cmd
-
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", path)
-	case "windows":
-		cmd = exec.Command("cmd", "/C", "start", "", path)
-	default:
-		cmd = exec.Command("xdg-open", path)
-	}
-
-	if err := cmd.Start(); err != nil {
-		logger.Write("Failed to open log file: %v", err)
-	}
+// fyneDesktopNotifier implements notifier.Notifier using Fyne's notification API.
+type fyneDesktopNotifier struct {
+	fyneApp fyne.App
 }
 
-func saveUploads(u *uploaded.Files, logger *logging.Logger) {
-	if err := u.Save(); err != nil {
-		logger.Write("WARNING: Failed to save upload history: %v", err)
-	}
+func (n *fyneDesktopNotifier) Notify(title, message string, _ int) {
+	n.fyneApp.SendNotification(fyne.NewNotification("SFTP Watchdog — "+title, message))
 }

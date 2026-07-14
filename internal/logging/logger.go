@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+// LogEntry represents a single log line with timestamp.
+type LogEntry struct {
+	Time    time.Time
+	Message string
+}
+
+// Logger provides daily-rotated file logging with subscriber support for the GUI.
 type Logger struct {
 	basePath      string
 	retentionDays int
@@ -18,10 +25,14 @@ type Logger struct {
 	logFile     *os.File
 	writer      io.Writer
 	mu          sync.Mutex
+
+	subscribers   []chan LogEntry
+	subscribersMu sync.RWMutex
 }
 
 var defaultLogger *Logger
 
+// Init creates a new Logger with daily rotation and starts the cleanup goroutine.
 func Init(basePath string, retentionDays int) (*Logger, error) {
 	l := &Logger{
 		basePath:      basePath,
@@ -29,12 +40,51 @@ func Init(basePath string, retentionDays int) (*Logger, error) {
 		currentDate:   time.Now().Format("2006-01-02"),
 		writer:        os.Stdout,
 	}
+
 	if err := l.openDailyLogFile(); err != nil {
 		return nil, err
 	}
+
 	defaultLogger = l
 	go l.cleanupLoop()
 	return l, nil
+}
+
+// Subscribe returns a channel that receives all log entries in real time.
+// The caller is responsible for reading from the channel to avoid blocking.
+func (l *Logger) Subscribe() chan LogEntry {
+	ch := make(chan LogEntry, 256)
+	l.subscribersMu.Lock()
+	l.subscribers = append(l.subscribers, ch)
+	l.subscribersMu.Unlock()
+	return ch
+}
+
+// Unsubscribe removes a subscriber channel and closes it.
+func (l *Logger) Unsubscribe(ch chan LogEntry) {
+	l.subscribersMu.Lock()
+	defer l.subscribersMu.Unlock()
+
+	for i, sub := range l.subscribers {
+		if sub == ch {
+			l.subscribers = append(l.subscribers[:i], l.subscribers[i+1:]...)
+			close(ch)
+			return
+		}
+	}
+}
+
+func (l *Logger) notifySubscribers(entry LogEntry) {
+	l.subscribersMu.RLock()
+	defer l.subscribersMu.RUnlock()
+
+	for _, ch := range l.subscribers {
+		select {
+		case ch <- entry:
+		default:
+			// Drop if subscriber is not keeping up
+		}
+	}
 }
 
 func (l *Logger) cleanupLoop() {
@@ -53,7 +103,7 @@ func (l *Logger) cleanupLoop() {
 func (l *Logger) openDailyLogFile() error {
 	dir := filepath.Dir(l.basePath)
 	if dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0750); err != nil {
 			return err
 		}
 	}
@@ -63,7 +113,7 @@ func (l *Logger) openDailyLogFile() error {
 	datedName := fmt.Sprintf("%s_%s%s", name, l.currentDate, ext)
 	fullPath := filepath.Join(dir, datedName)
 
-	f, err := os.OpenFile(fullPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(fullPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
@@ -79,6 +129,7 @@ func (l *Logger) openDailyLogFile() error {
 	return nil
 }
 
+// Write formats and writes a log line, rotating files daily and notifying subscribers.
 func (l *Logger) Write(format string, a ...interface{}) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -99,15 +150,18 @@ func (l *Logger) Write(format string, a ...interface{}) {
 	line := fmt.Sprintf("%s %s\n", ts, message)
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if l.writer != nil {
 		_, _ = l.writer.Write([]byte(line))
 	} else {
 		fmt.Print(line)
 	}
+	l.mu.Unlock()
+
+	// Notify GUI subscribers
+	l.notifySubscribers(LogEntry{Time: now, Message: message})
 }
 
+// Close flushes and closes the underlying log file.
 func (l *Logger) Close() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -123,10 +177,12 @@ func (l *Logger) cleanupOldLogs() {
 	if l.retentionDays <= 0 {
 		return
 	}
+
 	dir := filepath.Dir(l.basePath)
-	if dir == "." {
+	if dir == "" {
 		dir = "."
 	}
+
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -153,6 +209,7 @@ func (l *Logger) cleanupOldLogs() {
 	}
 }
 
+// L returns the default logger instance.
 func L() *Logger {
 	return defaultLogger
 }

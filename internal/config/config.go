@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// SFTPConfig holds credentials and connection details for one SFTP endpoint.
 type SFTPConfig struct {
 	Host                string `json:"host"`
 	Port                int    `json:"port"`
@@ -17,6 +18,7 @@ type SFTPConfig struct {
 	ExpectedFingerprint string `json:"expectedFingerprint"`
 }
 
+// ScheduleConfig defines the active scanning window.
 type ScheduleConfig struct {
 	Enabled  bool   `json:"enabled"`
 	Start    string `json:"start"`
@@ -24,6 +26,7 @@ type ScheduleConfig struct {
 	Timezone string `json:"timezone"`
 }
 
+// Config is the top-level application configuration.
 type Config struct {
 	SourceSFTP         SFTPConfig     `json:"sourceSFTP"`
 	TargetSFTP         SFTPConfig     `json:"targetSFTP"`
@@ -41,25 +44,51 @@ type Config struct {
 	MaxIdleScans       int            `json:"maxIdleScans"`
 }
 
+// Load reads and parses a config file, applies defaults, and validates.
 func Load(path string) (*Config, error) {
-	b, err := os.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+
 	var cfg Config
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		return nil, err
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
 	applyDefaults(&cfg)
+
 	if err := validateSchedule(cfg.ActiveSchedule); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("validate schedule: %w", err)
 	}
 
 	return &cfg, nil
 }
 
+// Save writes the config to the given path as indented JSON.
+func Save(cfg *Config, path string) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return fmt.Errorf("create config dir: %w", err)
+		}
+	}
+
+	return os.WriteFile(path, data, 0600)
+}
+
 func applyDefaults(cfg *Config) {
+	if cfg.SourceSFTP.Port == 0 {
+		cfg.SourceSFTP.Port = 22
+	}
+	if cfg.TargetSFTP.Port == 0 {
+		cfg.TargetSFTP.Port = 22
+	}
 	if cfg.IdleTimeoutSeconds == 0 {
 		cfg.IdleTimeoutSeconds = 30
 	}
@@ -78,6 +107,15 @@ func applyDefaults(cfg *Config) {
 	if cfg.ShowBalloonTimeout == 0 {
 		cfg.ShowBalloonTimeout = 10
 	}
+	if cfg.PollInterval == 0 {
+		cfg.PollInterval = 30
+	}
+	if cfg.KeepAliveDuration == 0 {
+		cfg.KeepAliveDuration = 30
+	}
+	if cfg.MaxIdleScans == 0 {
+		cfg.MaxIdleScans = 10
+	}
 	if cfg.ActiveSchedule == (ScheduleConfig{}) {
 		cfg.ActiveSchedule = ScheduleConfig{
 			Enabled:  false,
@@ -86,40 +124,35 @@ func applyDefaults(cfg *Config) {
 			Timezone: "Local",
 		}
 	}
-	if cfg.KeepAliveDuration == 0 {
-		cfg.KeepAliveDuration = 30
-	}
-	if cfg.PollInterval == 0 {
-		cfg.PollInterval = 30
-	}
-	if cfg.MaxIdleScans == 0 {
-		cfg.MaxIdleScans = 10
-	}
 	if cfg.EnableInitialSync == nil {
-		defaultVal := true
-		cfg.EnableInitialSync = &defaultVal
+		v := true
+		cfg.EnableInitialSync = &v
 	}
 }
 
-func validateSchedule(schedule ScheduleConfig) error {
-	if !schedule.Enabled {
+func validateSchedule(s ScheduleConfig) error {
+	if !s.Enabled {
 		return nil
 	}
 
-	startTime, err := time.ParseInLocation("15:04", schedule.Start, time.Local)
+	start, err := time.ParseInLocation("15:04", s.Start, time.Local)
 	if err != nil {
-		return fmt.Errorf("invalid start time: %w", err)
+		return fmt.Errorf("invalid start time %q: %w", s.Start, err)
 	}
-	endTime, err := time.ParseInLocation("15:04", schedule.End, time.Local)
+
+	end, err := time.ParseInLocation("15:04", s.End, time.Local)
 	if err != nil {
-		return fmt.Errorf("invalid end time: %w", err)
+		return fmt.Errorf("invalid end time %q: %w", s.End, err)
 	}
-	if endTime.Before(startTime) {
-		return fmt.Errorf("end time must be after start time")
+
+	if end.Before(start) {
+		return fmt.Errorf("end time %q must be after start time %q", s.End, s.Start)
 	}
+
 	return nil
 }
 
+// DefaultConfig returns a Config with sensible placeholder values.
 func DefaultConfig() *Config {
 	return &Config{
 		SourceSFTP: SFTPConfig{
@@ -148,15 +181,7 @@ func DefaultConfig() *Config {
 	}
 }
 
+// WriteDefaultConfig creates a default config file at the given path.
 func WriteDefaultConfig(path string) error {
-	cfg := DefaultConfig()
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil && filepath.Dir(path) != "." {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
+	return Save(DefaultConfig(), path)
 }

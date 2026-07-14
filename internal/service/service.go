@@ -3,7 +3,6 @@ package service
 import (
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
-	"github.com/schollz/progressbar/v3"
 
 	"SFTPUpload/internal/config"
 	"SFTPUpload/internal/logging"
@@ -21,42 +19,54 @@ import (
 	"SFTPUpload/internal/uploaded"
 )
 
-type Service struct {
-	cfg             *config.Config
-	srcMgr          *sftpclient.Manager
-	dstMgr          *sftpclient.Manager
-	uploaded        *uploaded.Files
-	notifier        notifier.Notifier
-	logger          *logging.Logger
-	progressOutput  io.Writer
-	progressManager *progressBarManager
-	scanNowCh       chan struct{}
-	scanMu          sync.Mutex
-}
-
+// UploadStat represents the progress of a single file upload.
 type UploadStat struct {
 	Filename string
 	Speed    string
-	Percent  float64 // 0.0 - 1.0
+	Percent  float64 // 0.0 – 1.0
 }
 
-func New(cfg *config.Config, srcMgr, dstMgr *sftpclient.Manager, uploaded *uploaded.Files, notifier notifier.Notifier, logger *logging.Logger, progressOutput io.Writer, statsCh chan<- UploadStat) *Service {
-	if progressOutput == nil {
-		progressOutput = io.Discard
-	}
+// ServiceEvent describes state changes the GUI should react to.
+type ServiceEvent struct {
+	Type    string // "status", "scan_start", "scan_end", "upload_start", "upload_done", "upload_fail", "error"
+	Message string
+}
+
+// Service orchestrates scan/upload/backup operations.
+type Service struct {
+	cfg        *config.Config
+	srcMgr     *sftpclient.Manager
+	dstMgr     *sftpclient.Manager
+	uploaded   *uploaded.Files
+	notifier   notifier.Notifier
+	logger     *logging.Logger
+	scanNowCh  chan struct{}
+	scanMu     sync.Mutex
+
+	StatsCh  chan UploadStat
+	EventsCh chan ServiceEvent
+
+	running   bool
+	runningMu sync.Mutex
+	stopCh    chan struct{}
+}
+
+// New creates a new Service.
+func New(cfg *config.Config, srcMgr, dstMgr *sftpclient.Manager, uploaded *uploaded.Files, notifier notifier.Notifier, logger *logging.Logger) *Service {
 	return &Service{
-		cfg:             cfg,
-		srcMgr:          srcMgr,
-		dstMgr:          dstMgr,
-		uploaded:        uploaded,
-		notifier:        notifier,
-		logger:          logger,
-		progressOutput:  progressOutput,
-		progressManager: newProgressBarManager(progressOutput, notifier, logger, statsCh),
-		scanNowCh:       make(chan struct{}, 4),
+		cfg:       cfg,
+		srcMgr:    srcMgr,
+		dstMgr:    dstMgr,
+		uploaded:  uploaded,
+		notifier:  notifier,
+		logger:    logger,
+		scanNowCh: make(chan struct{}, 4),
+		StatsCh:   make(chan UploadStat, 64),
+		EventsCh:  make(chan ServiceEvent, 64),
 	}
 }
 
+// ScanNow triggers an immediate scan from the GUI.
 func (s *Service) ScanNow() {
 	select {
 	case s.scanNowCh <- struct{}{}:
@@ -64,12 +74,59 @@ func (s *Service) ScanNow() {
 	}
 }
 
-func (s *Service) Start(stopCh <-chan struct{}) {
-	go s.scheduleScans(stopCh)
+// IsRunning reports whether the scanner loop is active.
+func (s *Service) IsRunning() bool {
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	return s.running
 }
 
+// Start begins the scheduled scan loop in the background.
+func (s *Service) Start() {
+	s.runningMu.Lock()
+	if s.running {
+		s.runningMu.Unlock()
+		return
+	}
+	s.stopCh = make(chan struct{})
+	s.running = true
+	s.runningMu.Unlock()
+
+	go s.scheduleScans(s.stopCh)
+	s.emitEvent("status", "Scanner started")
+}
+
+// Stop halts the scheduled scan loop.
+func (s *Service) Stop() {
+	s.runningMu.Lock()
+	if !s.running {
+		s.runningMu.Unlock()
+		return
+	}
+	close(s.stopCh)
+	s.running = false
+	s.runningMu.Unlock()
+
+	s.emitEvent("status", "Scanner stopped")
+}
+
+// RunImmediateScan performs a single synchronous scan.
 func (s *Service) RunImmediateScan() {
 	s.runScan(false)
+}
+
+func (s *Service) emitEvent(typ, msg string) {
+	select {
+	case s.EventsCh <- ServiceEvent{Type: typ, Message: msg}:
+	default:
+	}
+}
+
+func (s *Service) emitStat(stat UploadStat) {
+	select {
+	case s.StatsCh <- stat:
+	default:
+	}
 }
 
 func (s *Service) scheduleScans(stopCh <-chan struct{}) {
@@ -82,15 +139,16 @@ func (s *Service) scheduleScans(stopCh <-chan struct{}) {
 	defer ticker.Stop()
 
 	var idleCount int
-	var connected = true
+	connected := true
 
 	for {
 		select {
 		case <-stopCh:
 			s.logger.Write("Stopping scheduled scans")
 			return
+
 		case <-ticker.C:
-		go func() {
+			go func() {
 				defer func() {
 					if r := recover(); r != nil {
 						s.logger.Write("PANIC in scheduled scan: %v\n%s", r, debug.Stack())
@@ -107,9 +165,10 @@ func (s *Service) scheduleScans(stopCh <-chan struct{}) {
 
 				start := time.Now()
 				s.logger.Write("Scheduled scan starting (interval %s)", interval)
+				s.emitEvent("scan_start", "Scheduled scan starting")
 
 				if !connected {
-					s.logger.Write("Reconnecting SFTP sessions (previously disconnected due to inactivity)...")
+					s.logger.Write("Reconnecting SFTP sessions...")
 					if err := s.srcMgr.Connect(); err != nil {
 						s.logger.Write("ERROR: Failed to reconnect Source SFTP: %v", err)
 					}
@@ -125,7 +184,7 @@ func (s *Service) scheduleScans(stopCh <-chan struct{}) {
 
 				if newFiles == 0 {
 					idleCount++
-					s.logger.Write("No new files detected (%d/10 idle scans)", idleCount)
+					s.logger.Write("No new files detected (%d/%d idle scans)", idleCount, s.cfg.MaxIdleScans)
 				} else {
 					if idleCount > 0 {
 						s.logger.Write("Resetting idle counter — new files detected (%d)", newFiles)
@@ -141,9 +200,11 @@ func (s *Service) scheduleScans(stopCh <-chan struct{}) {
 					}
 					connected = false
 					idleCount = 0
-					s.notifier.Notify("SFTP Idle Disconnect", fmt.Sprintf("No new files detected after %d scans. Connection closed to save resources.", s.cfg.MaxIdleScans), 5)
+					s.notifier.Notify("SFTP Idle Disconnect",
+						fmt.Sprintf("No new files detected after %d scans. Connection closed.", s.cfg.MaxIdleScans), 5)
 				}
 
+				s.emitEvent("scan_end", fmt.Sprintf("Scan finished in %s, %d new files", time.Since(start).Round(time.Second), newFiles))
 				s.logger.Write("Scheduled scan finished in %s", time.Since(start).Round(time.Second))
 			}()
 
@@ -157,12 +218,13 @@ func (s *Service) scheduleScans(stopCh <-chan struct{}) {
 
 				if !s.tryLockScan() {
 					s.logger.Write("Manual scan skipped — another scan already running.")
-					s.notifier.Notify("Scan Busy", "A scan is already in progress. Please wait.", 5)
+					s.notifier.Notify("Scan Busy", "A scan is already in progress.", 5)
 					return
 				}
 				defer s.scanMu.Unlock()
 
 				s.logger.Write("Manual scan starting...")
+				s.emitEvent("scan_start", "Manual scan starting")
 				s.notifier.Notify("Manual Scan", "Manual scan started...", 5)
 
 				if !connected {
@@ -183,8 +245,9 @@ func (s *Service) scheduleScans(stopCh <-chan struct{}) {
 					idleCount = 0
 				}
 
+				s.emitEvent("scan_end", fmt.Sprintf("Manual scan completed, %d new files", newFiles))
 				s.logger.Write("Manual scan finished")
-				s.notifier.Notify("Manual Scan", "Manual scan completed successfully.", 5)
+				s.notifier.Notify("Manual Scan", "Manual scan completed.", 5)
 			}()
 		}
 	}
@@ -228,11 +291,11 @@ func (s *Service) runScan(async bool) int {
 	s.logger.Write("Preparing to start scan...")
 
 	if s.srcMgr.IsIdle() || !s.srcMgr.IsConnected() {
-		s.logger.Write("Source SFTP idle/disconnected → reconnecting (connect first)...")
+		s.logger.Write("Source SFTP idle/disconnected → reconnecting...")
 		if err := s.srcMgr.Connect(); err != nil {
-			s.logger.Write("Initial connect failed for source: %v → trying retryConnect()", err)
+			s.logger.Write("Initial connect failed: %v → retrying...", err)
 			if err := s.srcMgr.RetryConnect(); err != nil {
-				s.logger.Write("ERROR: Cannot reconnect source before scan: %v", err)
+				s.logger.Write("ERROR: Cannot reconnect source: %v", err)
 				return -1
 			}
 		}
@@ -240,19 +303,18 @@ func (s *Service) runScan(async bool) int {
 
 	client, err := s.srcMgr.GetClient()
 	if err != nil {
-		s.logger.Write("ERROR: Source client unavailable even after reconnect: %v", err)
+		s.logger.Write("ERROR: Source client unavailable: %v", err)
 		return -1
 	}
-	s.logger.Write("Source client ready, continuing scan...")
+	s.logger.Write("Source client ready")
 
 	if s.dstMgr != nil && s.cfg.TargetSFTP.Host != "" {
 		if s.dstMgr.IsIdle() || !s.dstMgr.IsConnected() {
-			s.logger.Write("Destination SFTP idle/disconnected → reconnecting (connect first)...")
+			s.logger.Write("Destination SFTP idle/disconnected → reconnecting...")
 			if err := s.dstMgr.Connect(); err != nil {
-				s.logger.Write("Initial connect failed for destination: %v → trying retryConnect()", err)
 				if err := s.dstMgr.RetryConnect(); err != nil {
-					s.logger.Write("WARNING: Cannot reconnect destination SFTP: %v", err)
-					s.logger.Write("Switching to backup-only mode for this scan")
+					s.logger.Write("WARNING: Cannot reconnect destination: %v", err)
+					s.logger.Write("Switching to backup-only mode")
 					s.dstMgr = nil
 				}
 			}
@@ -292,7 +354,7 @@ func (s *Service) runScan(async bool) int {
 		}
 
 		if s.uploaded.IsUploaded(remotePath, hash) {
-			s.logger.Write("Already processed: %s (hash match in uploaded.json)", remotePath)
+			s.logger.Write("Already processed: %s (hash match)", remotePath)
 			continue
 		}
 
@@ -300,16 +362,16 @@ func (s *Service) runScan(async bool) int {
 		s.logger.Write("New file detected: %s (size=%d, hash=%s)", remotePath, entry.Size(), hash)
 
 		if async {
-			go s.ProcessFile(remotePath)
+			go s.processFile(remotePath)
 		} else {
-			s.ProcessFile(remotePath)
+			s.processFile(remotePath)
 		}
 	}
 
 	if newFiles == 0 {
 		s.logger.Write("No new files found in %s", sourceBase)
 	} else {
-		s.logger.Write("Scan completed: %d new file(s) queued for processing", newFiles)
+		s.logger.Write("Scan completed: %d new file(s) queued", newFiles)
 	}
 	return newFiles
 }
@@ -328,24 +390,27 @@ func (s *Service) tryLockScan() bool {
 	}
 }
 
-func (s *Service) ProcessFile(remotePath string) {
+func (s *Service) processFile(remotePath string) {
 	defer func() {
 		if r := recover(); r != nil {
-			s.logger.Write("PANIC in ProcessFile(%s): %v\n%s", remotePath, r, debug.Stack())
+			s.logger.Write("PANIC in processFile(%s): %v\n%s", remotePath, r, debug.Stack())
 		}
 	}()
 
 	s.logger.Write("=== STARTING FILE PROCESSING: %s ===", remotePath)
+	s.emitEvent("upload_start", filepath.Base(remotePath))
 
 	srcClient, err := s.srcMgr.GetClient()
 	if err != nil {
 		s.logger.Write("ERROR: Cannot get source client for %s: %v", remotePath, err)
+		s.emitEvent("upload_fail", filepath.Base(remotePath))
 		return
 	}
 
 	fileInfo, err := srcClient.Stat(remotePath)
 	if err != nil {
 		s.logger.Write("ERROR: File %s no longer accessible: %v", remotePath, err)
+		s.emitEvent("upload_fail", filepath.Base(remotePath))
 		return
 	}
 
@@ -354,13 +419,12 @@ func (s *Service) ProcessFile(remotePath string) {
 	hash, err := sftpclient.ComputeRemoteFileHash(srcClient, remotePath)
 	if err != nil {
 		s.logger.Write("ERROR: Failed to compute hash for %s: %v", remotePath, err)
+		s.emitEvent("upload_fail", filepath.Base(remotePath))
 		return
 	}
 
-	s.logger.Write("Computed hash for %s: %s", remotePath, hash)
-
 	if s.uploaded.IsUploaded(remotePath, hash) {
-		s.logger.Write("File already processed (uploaded.json): %s", remotePath)
+		s.logger.Write("File already processed: %s", remotePath)
 		return
 	}
 
@@ -372,71 +436,56 @@ func (s *Service) ProcessFile(remotePath string) {
 		dstBase := filepath.ToSlash(s.cfg.TargetSFTP.TargetDirectory)
 		remoteDstPath := filepath.ToSlash(filepath.Join(dstBase, fileName))
 
-		s.logger.Write("Checking if destination has %s ...", remoteDstPath)
+		// Check if destination already has identical file
+		s.logger.Write("Checking destination for %s ...", remoteDstPath)
 		dstClient, dstErr := s.dstMgr.GetClient()
 		if dstErr == nil {
 			if _, err := dstClient.Stat(remoteDstPath); err == nil {
-				s.logger.Write("Destination file exists; computing hash to compare...")
 				dstHash, err := sftpclient.ComputeRemoteFileHash(dstClient, remoteDstPath)
-				if err == nil {
-					s.logger.Write("Destination hash: %s", dstHash)
-					if dstHash == hash {
-						s.logger.Write("Destination file has identical hash. Moving source to backup and marking uploaded.")
-						dateSubdir := time.Now().Format("2006-01-02")
-						backupBase := filepath.ToSlash(s.cfg.BackupDirectory)
-						backupDateDir := filepath.ToSlash(filepath.Join(backupBase, dateSubdir))
-						backupPath := filepath.ToSlash(filepath.Join(backupDateDir, fileName))
+				if err == nil && dstHash == hash {
+					s.logger.Write("Destination has identical file. Moving source to backup.")
+					dateSubdir := time.Now().Format("2006-01-02")
+					backupBase := filepath.ToSlash(s.cfg.BackupDirectory)
+					backupDateDir := filepath.ToSlash(filepath.Join(backupBase, dateSubdir))
+					backupPath := filepath.ToSlash(filepath.Join(backupDateDir, fileName))
 
-						if err := s.srcMgr.MoveRemoteToBackup(remotePath, backupPath); err != nil {
-							s.logger.Write("ERROR: Failed to move %s to backup: %v", remotePath, err)
-						} else {
-							backupSuccess = true
-							if err := s.uploaded.MarkUploaded(remotePath, hash); err != nil {
-								s.logger.Write("ERROR: Failed to mark %s as uploaded: %v", remotePath, err)
-							} else {
-								s.logger.Write("Marked %s as uploaded in uploaded.json (skipped upload because identical file existed)", remotePath)
-							}
+					if err := s.srcMgr.MoveRemoteToBackup(remotePath, backupPath); err != nil {
+						s.logger.Write("ERROR: Failed to move %s to backup: %v", remotePath, err)
+					} else {
+						if err := s.uploaded.MarkUploaded(remotePath, hash); err != nil {
+							s.logger.Write("ERROR: Failed to mark %s as uploaded: %v", remotePath, err)
 						}
-						s.logger.Write("=== COMPLETED FILE PROCESSING (skipped upload): %s ===", remotePath)
-						return
+						s.logger.Write("Marked %s as uploaded (skipped — identical file existed)", remotePath)
 					}
-				} else {
-					s.logger.Write("WARNING: Could not compute dest file hash: %v", err)
+					s.emitEvent("upload_done", fileName)
+					s.logger.Write("=== COMPLETED FILE PROCESSING (skipped upload): %s ===", remotePath)
+					return
 				}
 			}
-		} else {
-			s.logger.Write("WARNING: Could not access destination client to check existing file: %v", dstErr)
 		}
 
-		s.logger.Write("ATTEMPTING COPY: %s -> %s", remotePath, filepath.Join(s.cfg.TargetSFTP.TargetDirectory, fileName))
-
+		// Copy file to destination
+		s.logger.Write("COPYING: %s -> %s", remotePath, remoteDstPath)
 		for attempt := 1; attempt <= s.cfg.ReconnectRetries+1; attempt++ {
 			s.logger.Write("Copy attempt %d/%d", attempt, s.cfg.ReconnectRetries+1)
 
-			duration, err := s.copyRemoteFileWithTiming(remotePath, filepath.ToSlash(filepath.Join(s.cfg.TargetSFTP.TargetDirectory, fileName)))
+			duration, err := s.copyRemoteFileWithProgress(remotePath, remoteDstPath)
 			if err == nil {
-				s.logger.Write("SUCCESS: Copied %s to destination in %s", fileName, duration)
-				s.notifier.Notify("File Uploaded", fmt.Sprintf("File %s uploaded successfully in %s", fileName, duration.Round(time.Millisecond)), 5)
+				s.logger.Write("SUCCESS: Copied %s in %s", fileName, duration)
+				s.notifier.Notify("File Uploaded", fmt.Sprintf("%s uploaded in %s", fileName, duration.Round(time.Millisecond)), 5)
 				copySuccess = true
 				break
 			}
 
 			s.logger.Write("FAILED attempt %d: %v", attempt, err)
 
-			if strings.Contains(err.Error(), "SSH_FX_FAILURE") {
-				s.logger.Write("SFTP server returned SSH_FX_FAILURE - this may be a temporary server issue")
-			}
-
 			if attempt <= s.cfg.ReconnectRetries {
 				retryDelay := time.Duration(s.cfg.ReconnectInterval) * time.Second
 				s.logger.Write("Retrying in %v...", retryDelay)
 				time.Sleep(retryDelay)
-
-				if err := s.srcMgr.RetryConnect(); err != nil {
-					s.logger.Write("Reconnect source failed: %v", err)
-				}
-				if err := s.dstMgr.RetryConnect(); err != nil {
-					s.logger.Write("Reconnect destination failed: %v", err)
+				_ = s.srcMgr.RetryConnect()
+				if s.dstMgr != nil {
+					_ = s.dstMgr.RetryConnect()
 				}
 			} else {
 				s.logger.Write("ALL COPY ATTEMPTS FAILED for %s", remotePath)
@@ -444,44 +493,31 @@ func (s *Service) ProcessFile(remotePath string) {
 			}
 		}
 
+		// Move to backup on successful copy
 		if copySuccess {
 			dateSubdir := time.Now().Format("2006-01-02")
 			backupBase := filepath.ToSlash(s.cfg.BackupDirectory)
 			backupDateDir := filepath.ToSlash(filepath.Join(backupBase, dateSubdir))
 			backupPath := filepath.ToSlash(filepath.Join(backupDateDir, fileName))
 
-			s.logger.Write("MOVING TO BACKUP: %s -> %s (date-based subdirectory)", remotePath, backupPath)
-
+			s.logger.Write("MOVING TO BACKUP: %s -> %s", remotePath, backupPath)
 			for attempt := 1; attempt <= s.cfg.ReconnectRetries+1; attempt++ {
-				s.logger.Write("Backup move attempt %d/%d", attempt, s.cfg.ReconnectRetries+1)
-
 				err := s.srcMgr.MoveRemoteToBackup(remotePath, backupPath)
 				if err == nil {
-					s.logger.Write("SUCCESS: Moved %s to backup %s", fileName, backupPath)
-					s.notifier.Notify("File Moved to Backup", fmt.Sprintf("File %s moved to backup", fileName), 5)
+					s.logger.Write("SUCCESS: Moved %s to backup", fileName)
 					backupSuccess = true
 					break
 				}
-
 				s.logger.Write("FAILED backup attempt %d: %v", attempt, err)
-
 				if attempt <= s.cfg.ReconnectRetries {
-					retryDelay := time.Duration(s.cfg.ReconnectInterval) * time.Second
-					s.logger.Write("Retrying in %v...", retryDelay)
-					time.Sleep(retryDelay)
-					if err := s.srcMgr.RetryConnect(); err != nil {
-						s.logger.Write("Reconnect source failed: %v", err)
-					}
-				} else {
-					s.logger.Write("ALL BACKUP ATTEMPTS FAILED for %s", remotePath)
-					s.notifier.Notify("Backup Failed", fmt.Sprintf("Failed to move %s to backup", fileName), 5)
+					time.Sleep(time.Duration(s.cfg.ReconnectInterval) * time.Second)
+					_ = s.srcMgr.RetryConnect()
 				}
 			}
-		} else {
-			s.logger.Write("Copy failed, skipping backup move for %s", remotePath)
 		}
 	} else {
-		s.logger.Write("No destination SFTP configured; moving to backup only.")
+		// No destination — backup only mode
+		s.logger.Write("No destination configured; moving to backup only.")
 		dateSubdir := time.Now().Format("2006-01-02")
 		backupBase := filepath.ToSlash(s.cfg.BackupDirectory)
 		backupDateDir := filepath.ToSlash(filepath.Join(backupBase, dateSubdir))
@@ -490,9 +526,7 @@ func (s *Service) ProcessFile(remotePath string) {
 			s.logger.Write("ERROR: Failed to move %s to backup: %v", remotePath, err)
 		} else {
 			backupSuccess = true
-			if err := s.uploaded.MarkUploaded(remotePath, hash); err != nil {
-				s.logger.Write("ERROR: Failed to mark %s as uploaded: %v", remotePath, err)
-			}
+			_ = s.uploaded.MarkUploaded(remotePath, hash)
 		}
 	}
 
@@ -500,16 +534,18 @@ func (s *Service) ProcessFile(remotePath string) {
 		if err := s.uploaded.MarkUploaded(remotePath, hash); err != nil {
 			s.logger.Write("ERROR: Failed to mark %s as uploaded: %v", remotePath, err)
 		} else {
-			s.logger.Write("SUCCESS: Marked %s as uploaded in JSON - will not be processed again", remotePath)
+			s.logger.Write("SUCCESS: Marked %s as uploaded", remotePath)
 		}
+		s.emitEvent("upload_done", fileName)
 	} else {
-		s.logger.Write("File %s not marked as uploaded because operation was not fully successful (copy: %v, backup: %v)", fileName, copySuccess, backupSuccess)
+		s.logger.Write("File %s not fully processed (copy: %v, backup: %v)", fileName, copySuccess, backupSuccess)
+		s.emitEvent("upload_fail", fileName)
 	}
 
 	s.logger.Write("=== COMPLETED FILE PROCESSING: %s ===", remotePath)
 }
 
-func (s *Service) copyRemoteFileWithTiming(remoteSrcPath, remoteDstPath string) (time.Duration, error) {
+func (s *Service) copyRemoteFileWithProgress(remoteSrcPath, remoteDstPath string) (time.Duration, error) {
 	start := time.Now()
 
 	srcClient, err := s.srcMgr.GetClient()
@@ -551,12 +587,16 @@ func (s *Service) copyRemoteFileWithTiming(remoteSrcPath, remoteDstPath string) 
 		return 0, fmt.Errorf("open destination tmp=%s err=%v", tmpDst, err)
 	}
 
+	// Use a progress-reporting writer
 	filename := filepath.Base(remoteSrcPath)
-	bar := s.progressManager.CreateBar(filename, info.Size())
-	defer s.progressManager.RemoveBar(filename)
+	pw := &progressWriter{
+		total:    info.Size(),
+		filename: filename,
+		service:  s,
+		start:    start,
+	}
 
-	multiWriter := io.MultiWriter(dstFile, bar)
-
+	multiWriter := io.MultiWriter(dstFile, pw)
 	_, err = io.Copy(multiWriter, srcFile)
 	if err != nil {
 		dstFile.Close()
@@ -569,6 +609,7 @@ func (s *Service) copyRemoteFileWithTiming(remoteSrcPath, remoteDstPath string) 
 		return 0, fmt.Errorf("close destination file err=%v", err)
 	}
 
+	// Verify size
 	tmpInfo, err := dstClient.Stat(tmpDst)
 	if err != nil {
 		_ = dstClient.Remove(tmpDst)
@@ -579,16 +620,15 @@ func (s *Service) copyRemoteFileWithTiming(remoteSrcPath, remoteDstPath string) 
 		return 0, fmt.Errorf("temp file size mismatch: expected %d, got %d", info.Size(), tmpInfo.Size())
 	}
 
+	// Remove existing destination file if present
 	if _, err := dstClient.Stat(remoteDstPath); err == nil {
-		s.logger.Write("Destination file already exists, removing: %s", remoteDstPath)
-		if err := dstClient.Remove(remoteDstPath); err != nil {
-			s.logger.Write("WARNING: Could not remove existing destination file: %v", err)
-		}
+		s.logger.Write("Destination file exists, removing: %s", remoteDstPath)
+		_ = dstClient.Remove(remoteDstPath)
 	}
 
+	// Rename with retries
 	var renameErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		s.logger.Write("Rename attempt %d/3: %s -> %s", attempt, tmpDst, remoteDstPath)
 		renameErr = dstClient.Rename(tmpDst, remoteDstPath)
 		if renameErr == nil {
 			break
@@ -606,9 +646,10 @@ func (s *Service) copyRemoteFileWithTiming(remoteSrcPath, remoteDstPath string) 
 		return 0, fmt.Errorf("rename tmp=%s to final=%s err=%v", tmpDst, remoteDstPath, renameErr)
 	}
 
+	// Final verification
 	finalInfo, err := dstClient.Stat(remoteDstPath)
 	if err != nil {
-		return 0, fmt.Errorf("cannot verify final file after rename: %v", err)
+		return 0, fmt.Errorf("cannot verify final file: %v", err)
 	}
 	if finalInfo.Size() != info.Size() {
 		return 0, fmt.Errorf("final file size mismatch: expected %d, got %d", info.Size(), finalInfo.Size())
@@ -619,7 +660,45 @@ func (s *Service) copyRemoteFileWithTiming(remoteSrcPath, remoteDstPath string) 
 
 	dur := time.Since(start)
 	s.logger.Write("Copied %s -> %s size=%d duration=%s", remoteSrcPath, remoteDstPath, info.Size(), dur)
+
+	// Send 100% stat
+	s.emitStat(UploadStat{Filename: filename, Speed: sftpclient.TransferSpeed(info.Size(), int64(dur.Seconds())), Percent: 1.0})
+
 	return dur, nil
+}
+
+// progressWriter implements io.Writer and emits UploadStat events periodically.
+type progressWriter struct {
+	written  int64
+	total    int64
+	filename string
+	service  *Service
+	start    time.Time
+	lastEmit time.Time
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	pw.written += int64(n)
+
+	now := time.Now()
+	if now.Sub(pw.lastEmit) >= 500*time.Millisecond {
+		elapsed := now.Sub(pw.start).Seconds()
+		var speed string
+		if elapsed > 0 {
+			speed = sftpclient.TransferSpeed(pw.written, int64(elapsed))
+		} else {
+			speed = "0 B/s"
+		}
+		percent := float64(pw.written) / float64(pw.total)
+		if percent > 1.0 {
+			percent = 1.0
+		}
+		pw.service.emitStat(UploadStat{Filename: pw.filename, Speed: speed, Percent: percent})
+		pw.lastEmit = now
+	}
+
+	return n, nil
 }
 
 func setupBackupDirectory(client *sftp.Client, cfg *config.Config, logger *logging.Logger) error {
@@ -628,16 +707,15 @@ func setupBackupDirectory(client *sftp.Client, cfg *config.Config, logger *loggi
 	backupDateDir := filepath.ToSlash(filepath.Join(backupBase, dateSubdir))
 
 	logger.Write("Verifying backup date directory: %s", backupDateDir)
-
 	if err := sftpclient.EnsureDirWritable(client, backupDateDir, logger); err != nil {
-		logger.Write("ERROR: Backup date directory %s not writable: %v", backupDateDir, err)
 		return fmt.Errorf("backup date directory %s not writable: %v", backupDateDir, err)
 	}
 
-	logger.Write("Backup directory %s is ready and writable", backupDateDir)
+	logger.Write("Backup directory %s is ready", backupDateDir)
 	return nil
 }
 
+// PrepareDirectories creates source and backup directories on the SFTP servers.
 func (s *Service) PrepareDirectories() error {
 	srcBase := filepath.ToSlash(s.cfg.SourceSFTP.TargetDirectory)
 	backupBase := filepath.ToSlash(s.cfg.BackupDirectory)
@@ -658,6 +736,7 @@ func (s *Service) PrepareDirectories() error {
 	return nil
 }
 
+// TestConnections verifies SFTP connectivity to source and destination.
 func (s *Service) TestConnections() {
 	s.logger.Write("Testing source SFTP connection...")
 	testSFTPConnection(s.srcMgr, "Source", s.logger)
@@ -672,6 +751,59 @@ func (s *Service) TestConnections() {
 		s.logger.Write("Testing destination SFTP capabilities...")
 		testSFTPCapabilities(s.dstMgr, "Destination", s.logger)
 	}
+}
+
+// SourceConnected reports whether the source SFTP is currently connected.
+func (s *Service) SourceConnected() bool {
+	return s.srcMgr.IsConnected()
+}
+
+// DestConnected reports whether the destination SFTP is currently connected.
+func (s *Service) DestConnected() bool {
+	if s.dstMgr == nil {
+		return false
+	}
+	return s.dstMgr.IsConnected()
+}
+
+// CloseAll tears down both SFTP connections and saves upload history.
+func (s *Service) CloseAll() {
+	s.logger.Write("Closing SFTP connections...")
+	s.srcMgr.Close()
+	if s.dstMgr != nil {
+		s.dstMgr.Close()
+	}
+	if err := s.uploaded.Save(); err != nil {
+		s.logger.Write("WARNING: Failed to save upload history: %v", err)
+	}
+	s.logger.Write("=== Program exited gracefully ===")
+}
+
+// ConnectAll establishes connections to source and (optionally) destination SFTP.
+func (s *Service) ConnectAll() error {
+	if err := s.srcMgr.Connect(); err != nil {
+		s.logger.Write("ERROR: Source SFTP connect failed: %v", err)
+		if err := s.srcMgr.RetryConnect(); err != nil {
+			s.logger.Write("ERROR: Failed to reconnect source: %v", err)
+			return fmt.Errorf("source SFTP: %w", err)
+		}
+	} else {
+		s.logger.Write("Source SFTP connected successfully")
+	}
+
+	if s.dstMgr != nil {
+		if err := s.dstMgr.Connect(); err != nil {
+			s.logger.Write("ERROR: Destination SFTP connect failed: %v", err)
+			if err := s.dstMgr.RetryConnect(); err != nil {
+				s.logger.Write("ERROR: Failed to reconnect destination: %v", err)
+				// Not fatal — can still operate in backup-only mode
+			}
+		} else {
+			s.logger.Write("Destination SFTP connected successfully")
+		}
+	}
+
+	return nil
 }
 
 func testSFTPConnection(mgr *sftpclient.Manager, name string, logger *logging.Logger) {
@@ -709,17 +841,15 @@ func testSFTPCapabilities(mgr *sftpclient.Manager, name string, logger *logging.
 		logger.Write("%s SFTP: Directory creation test failed: %v", name, err)
 	} else {
 		logger.Write("%s SFTP: Directory creation test passed", name)
-		client.RemoveDirectory(testDir)
+		_ = client.RemoveDirectory(testDir)
 	}
 
 	testFile := testDir + "/test.txt"
-	testContent := "SFTP test file content"
-
 	f, err := client.Create(testFile)
 	if err != nil {
 		logger.Write("%s SFTP: File creation test failed: %v", name, err)
 	} else {
-		_, _ = f.Write([]byte(testContent))
+		_, _ = f.Write([]byte("SFTP test"))
 		f.Close()
 		logger.Write("%s SFTP: File creation and write test passed", name)
 
@@ -728,7 +858,7 @@ func testSFTPCapabilities(mgr *sftpclient.Manager, name string, logger *logging.
 			logger.Write("%s SFTP: File rename test failed: %v", name, err)
 		} else {
 			logger.Write("%s SFTP: File rename test passed", name)
-			client.Remove(newTestFile)
+			_ = client.Remove(newTestFile)
 		}
 	}
 
@@ -739,131 +869,4 @@ func testSFTPCapabilities(mgr *sftpclient.Manager, name string, logger *logging.
 	}
 
 	logger.Write("%s SFTP capabilities test completed", name)
-}
-
-type progressBarManager struct {
-	mu      sync.Mutex
-	bars    map[string]*progressbar.ProgressBar
-	writer  io.Writer
-	notify  notifier.Notifier
-	logger  *logging.Logger
-	statsCh chan<- UploadStat
-}
-
-func newProgressBarManager(writer io.Writer, notify notifier.Notifier, logger *logging.Logger, statsCh chan<- UploadStat) *progressBarManager {
-	return &progressBarManager{
-		bars:    make(map[string]*progressbar.ProgressBar),
-		writer:  writer,
-		notify:  notify,
-		logger:  logger,
-		statsCh: statsCh,
-	}
-}
-
-func (p *progressBarManager) CreateBar(filename string, size int64) *progressbar.ProgressBar {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if existing, exists := p.bars[filename]; exists {
-		existing.Close()
-	}
-
-	bar := progressbar.NewOptions64(
-		size,
-		progressbar.OptionSetDescription(fmt.Sprintf("Copying %s", truncateFilename(filename, 30))),
-		progressbar.OptionSetWidth(30),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionShowCount(),
-		progressbar.OptionSetWriter(p.writer),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "=",
-			SaucerHead:    ">",
-			SaucerPadding: " ",
-			BarStart:      "[",
-			BarEnd:        "]",
-		}),
-		progressbar.OptionClearOnFinish(),
-		progressbar.OptionThrottle(65*time.Millisecond),
-		progressbar.OptionOnCompletion(func() {
-			fmt.Fprint(p.writer, "\n")
-		}),
-	)
-
-	if p.writer == io.Discard {
-		go p.notifyProgress(filename, bar)
-	}
-
-	p.bars[filename] = bar
-	return bar
-}
-
-func (p *progressBarManager) notifyProgress(filename string, bar *progressbar.ProgressBar) {
-	defer func() {
-		if r := recover(); r != nil {
-			p.logger.Write("PANIC in notifyProgress(%s): %v\n%s", filename, r, debug.Stack())
-		}
-	}()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	var lastBytes int64
-	var lastPercent float64
-	var lastBalloon time.Time
-
-	for range ticker.C {
-		state := bar.State()
-		current := state.CurrentPercent
-		bytes := state.CurrentBytes
-
-		if math.IsNaN(current) || current <= 0 {
-			continue
-		}
-
-		speedBytes := int64(bytes) - lastBytes
-		speedStr := sftpclient.TransferSpeed(speedBytes, 10)
-
-		progressDelta := current - lastPercent
-		if progressDelta >= 0.1 || time.Since(lastBalloon) > 30*time.Second {
-			p.notify.Notify("Uploading "+filename, fmt.Sprintf("%.1f%% complete\nSpeed: %s", current*100, speedStr), 5)
-			lastPercent = current
-			lastBalloon = time.Now()
-		}
-
-		// send stats to tray (non-blocking)
-		if p.statsCh != nil {
-			select {
-			case p.statsCh <- UploadStat{Filename: filename, Speed: speedStr, Percent: current}:
-			default:
-			}
-		}
-
-		if current >= 1.0 {
-			p.notify.Notify("Upload Complete", fmt.Sprintf("%s finished successfully.\nAverage speed: %s", filename, speedStr), 5)
-			return
-		}
-
-		lastBytes = int64(bytes)
-	}
-}
-
-func (p *progressBarManager) RemoveBar(filename string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if bar, exists := p.bars[filename]; exists {
-		bar.Close()
-		delete(p.bars, filename)
-	}
-}
-
-func truncateFilename(filename string, maxLength int) string {
-	if len(filename) <= maxLength {
-		return filename
-	}
-	ext := filepath.Ext(filename)
-	name := filename[:len(filename)-len(ext)]
-	if len(name) > maxLength-3-len(ext) {
-		name = name[:maxLength-3-len(ext)] + "..."
-	}
-	return name + ext
 }

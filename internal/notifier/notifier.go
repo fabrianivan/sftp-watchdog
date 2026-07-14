@@ -1,17 +1,11 @@
 package notifier
 
-import "github.com/gen2brain/beeep"
-
+// Notifier sends desktop notifications to the user.
 type Notifier interface {
 	Notify(title, message string, timeoutSec int)
 }
 
-type BeeepNotifier struct{}
-
-func (BeeepNotifier) Notify(title, message string, _ int) {
-	_ = beeep.Notify("SFTP Uploader - "+title, message, "assets/logo.ico")
-}
-
+// NoopNotifier discards all notifications.
 type NoopNotifier struct{}
 
 func (NoopNotifier) Notify(string, string, int) {}

@@ -27,6 +27,12 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
 
+      - name: Install macOS dependencies
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          # Fyne requires certain system libraries on macOS
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -46,8 +52,10 @@ jobs:
         if: startsWith(matrix.os, 'windows')
         shell: pwsh
         run: |
-          $env:CGO_ENABLED = "0"
-          go build -o sftpwatchdog.exe .
+          $env:CGO_ENABLED = "1"
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          go build -ldflags "-H=windowsgui -s -w" -o sftpwatchdog.exe .
 
   release-tag:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
@@ -141,16 +149,16 @@ jobs:
           $env:Path += ";" + (go env GOPATH) + "\bin"
           goversioninfo -icon="assets/logo.ico" -manifest="app.manifest" -64=true
 
-      - name: Build Windows tray binary
+      - name: Build Windows GUI binary
         shell: pwsh
         run: |
           go mod download
-          $env:CGO_ENABLED="0"
+          $env:CGO_ENABLED="1"
           $env:GOOS="windows"
           $env:GOARCH="amd64"
           $ldflags = "-H=windowsgui -s -w"
           if ("${{ needs.release-tag.outputs.version }}" -ne "") { $ldflags += " -X main.version=${{ needs.release-tag.outputs.version }}" }
-          go build -ldflags $ldflags -o sftpwatchdog.exe
+          go build -ldflags $ldflags -o sftpwatchdog.exe .
 
       - name: Publish Release (Windows)
         uses: softprops/action-gh-release@v1
@@ -186,9 +194,9 @@ jobs:
           VERSION="${{ needs.release-tag.outputs.version }}"
           LDFLAGS="-s -w"
           if [ -n "$VERSION" ]; then LDFLAGS="$LDFLAGS -X main.version=$VERSION"; fi
-          # Native arm64 build (cgo required for systray)
+          # Native arm64 build (cgo required for Fyne)
           CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o sftpwatchdog-macos-arm64
-          # Cross-compile x86_64 with cgo by forcing arch flags for clang
+          # Cross-compile x86_64 with cgo
           CGO_ENABLED=1 \
           CC="$(xcrun --sdk macosx --find clang)" \
           CXX="$(xcrun --sdk macosx --find clang++)" \
