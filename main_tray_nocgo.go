@@ -1,4 +1,4 @@
-//go:build !cgo
+//go:build !windows && (!darwin || !cgo)
 
 package main
 
@@ -8,8 +8,8 @@ import (
 	"SFTPUpload/internal/service"
 )
 
-// startTray is a no-op when building without cgo; it logs that tray is disabled
-// and consumes stats to write them to the logger for visibility.
+// startTray is a no-op on unsupported platforms and on macOS builds without
+// cgo. It consumes stats to write them to the logger for visibility.
 func startTray(svc *service.Service, cfg *config.Config, logger *logging.Logger, statsCh <-chan service.UploadStat) {
 	logger.Write("Tray disabled (built without cgo). Running headless.")
 	go func() {
